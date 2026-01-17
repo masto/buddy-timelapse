@@ -38,6 +38,27 @@ export interface StatusJob {
   progress?: number;
   time_remaining?: number;
   time_printing?: number;
+  display_name?: string;
+  display_path?: string;
+}
+
+export interface JobFile {
+  name: string;
+  display_name: string;
+  path: string;
+  display_path: string;
+  size: number;
+  m_timestamp: number;
+}
+
+export interface Job {
+  id: number;
+  state: 'PRINTING' | 'PAUSED' | 'FINISHED' | 'STOPPED' | 'ERROR';
+  progress: number;
+  time_remaining: number;
+  time_printing: number;
+  file?: JobFile;
+  serial_print?: boolean;
 }
 
 export interface StatusTransfer {

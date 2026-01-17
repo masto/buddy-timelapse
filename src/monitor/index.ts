@@ -17,10 +17,12 @@ export class PrintMonitor {
   private apiClient: PrusaLinkClient;
   private timelapseCapture: TimelapseCapture;
   private currentPrintId: number | null = null;
+  private currentPrintFilename: string | null = null;
   private isMonitoring = false;
   private monitoringInterval: NodeJS.Timeout | null = null;
   private lastPrinterState: PrinterState | null = null;
   private watchdogExpiry: number | null = null; // timestamp when watchdog expires
+  private isFirstCheck = true; // Track if this is the first status check
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -77,24 +79,49 @@ export class PrintMonitor {
       // Check for state transitions
       const previousState = this.lastPrinterState;
 
-      // Print started
-      if (
-        previousState !== "PRINTING" &&
-        currentState === "PRINTING" &&
-        currentJobId !== null
-      ) {
-        await this.handlePrintStarted(currentJobId);
-      }
-      // Print finished/stopped - any transition from PRINTING to non-PRINTING
-      else if (previousState === "PRINTING" && currentState !== "PRINTING") {
-        await this.handlePrintFinished(currentJobId);
-      }
-      // If we're currently capturing and see PRINTING state, reset watchdog
-      else if (
-        this.timelapseCapture.isCurrentlyCapturing() &&
-        currentState === "PRINTING"
-      ) {
-        this.resetWatchdog();
+      // Handle first check specially for resume logic
+      if (this.isFirstCheck) {
+        this.isFirstCheck = false;
+
+        if (currentState === "PRINTING" && currentJobId !== null) {
+          // First check shows PRINTING - check if we can resume
+          if (this.timelapseCapture.canResume()) {
+            console.log("Startup detected PRINTING state with existing frames - resuming capture");
+            await this.handlePrintStarted(currentJobId, true);
+          } else {
+            console.log("Startup detected PRINTING state but no existing frames - starting fresh capture");
+            await this.handlePrintStarted(currentJobId, false);
+          }
+        } else {
+          // First check is non-PRINTING - clear any stale frames from previous runs
+          if (this.timelapseCapture.canResume()) {
+            console.log("Startup detected non-PRINTING state - clearing stale frames from previous run");
+            this.timelapseCapture.clearFrames();
+          }
+        }
+      } else {
+        // Normal state transition handling (not first check)
+
+        // Print started
+        if (
+          previousState !== "PRINTING" &&
+          currentState === "PRINTING" &&
+          currentJobId !== null
+        ) {
+          // Not resuming - this is a fresh print start
+          await this.handlePrintStarted(currentJobId, false);
+        }
+        // Print finished/stopped - any transition from PRINTING to non-PRINTING
+        else if (previousState === "PRINTING" && currentState !== "PRINTING") {
+          await this.handlePrintFinished(currentJobId);
+        }
+        // If we're currently capturing and see PRINTING state, reset watchdog
+        else if (
+          this.timelapseCapture.isCurrentlyCapturing() &&
+          currentState === "PRINTING"
+        ) {
+          this.resetWatchdog();
+        }
       }
 
       this.lastPrinterState = currentState;
@@ -115,7 +142,7 @@ export class PrintMonitor {
     }
   }
 
-  private async handlePrintStarted(jobId: number): Promise<void> {
+  private async handlePrintStarted(jobId: number, shouldResume: boolean = false): Promise<void> {
     console.log(`Print started (Job ID: ${jobId})`);
 
     // Reject if already capturing (shouldn't happen, but safety check)
@@ -127,7 +154,27 @@ export class PrintMonitor {
     }
 
     try {
-      await this.timelapseCapture.startCapture();
+      // Fetch full job details to get the filename
+      const job = await this.apiClient.getJob();
+      if (job && job.file && job.file.display_name) {
+        this.currentPrintFilename = job.file.display_name;
+        console.log(`Print file: ${this.currentPrintFilename}`);
+      } else {
+        console.log("No file information available for this job");
+      }
+
+      // Log resume status
+      if (shouldResume && this.timelapseCapture.canResume()) {
+        const frameInfo = this.timelapseCapture.getFrameInfo();
+        console.log(
+          `Resuming timelapse capture - ${frameInfo.count} frames already captured (last: ${frameInfo.lastFrame})`
+        );
+      } else if (!shouldResume) {
+        // Clear any existing frames since we're starting fresh
+        this.timelapseCapture.clearFrames();
+      }
+
+      await this.timelapseCapture.startCapture(shouldResume);
       console.log("Timelapse capture started");
 
       // Start watchdog if enabled
@@ -147,6 +194,7 @@ export class PrintMonitor {
 
     if (!this.timelapseCapture.isCurrentlyCapturing()) {
       console.log("No active timelapse capture to stop");
+      this.currentPrintFilename = null;
       return;
     }
 
@@ -158,6 +206,9 @@ export class PrintMonitor {
       const outputPath = this.generateOutputPath(jobId);
       await assembleVideo(this.config.timelapse, outputPath);
 
+      // Clear temp directory after successful video assembly
+      this.timelapseCapture.clearFrames();
+
       // Send notification
       await this.sendNotification(outputPath);
 
@@ -166,6 +217,10 @@ export class PrintMonitor {
       console.error(
         `Error during timelapse completion: ${(error as Error).message}`
       );
+      // Note: We don't clear frames on error so they can be recovered manually
+    } finally {
+      // Always clear filename after print finishes
+      this.currentPrintFilename = null;
     }
   }
 
@@ -186,8 +241,20 @@ export class PrintMonitor {
       .toISOString()
       .replace(/[:.]/g, "-")
       .slice(0, -5);
-    const jobSuffix = jobId ? `_job${jobId}` : "";
-    const filename = `timelapse_${timestamp}${jobSuffix}.mp4`;
+    
+    let filename: string;
+    
+    // If we have a print filename, use it (without extension)
+    if (this.currentPrintFilename) {
+      const printName = this.currentPrintFilename.replace(/\.[^/.]+$/, "");
+      const sanitizedName = printName.replace(/[<>:"/\\|?*]/g, "_");
+      filename = `timelapse_${sanitizedName}_${timestamp}.mp4`;
+    } else {
+      // Fallback to date/time only
+      const jobSuffix = jobId ? `_job${jobId}` : "";
+      filename = `timelapse_${timestamp}${jobSuffix}.mp4`;
+    }
+    
     return resolve(this.config.timelapse.outputDirectory, filename);
   }
 

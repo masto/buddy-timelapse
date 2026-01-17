@@ -21,7 +21,7 @@ export class TimelapseCapture {
     this.tempDir = resolve(this.config.tempDirectory);
   }
 
-  async startCapture(): Promise<void> {
+  async startCapture(resumeIfPossible: boolean = true): Promise<void> {
     if (this.isCapturing) {
       throw new TimelapseError("Capture already in progress");
     }
@@ -35,14 +35,27 @@ export class TimelapseCapture {
       );
     }
 
-    // Clear any existing images in temp directory
-    this.clearTempDirectory();
+    // Check if we have existing frames to resume from
+    const existingFrameCount = this.getCapturedFrameCount();
+    const isResuming = resumeIfPossible && existingFrameCount > 0;
+    let startNumber = 1;
+
+    if (isResuming) {
+      // Get the highest frame number and continue from the next one
+      startNumber = this.getHighestFrameNumber() + 1;
+      console.log(
+        `Resuming timelapse capture with ${existingFrameCount} existing frames (starting from frame ${startNumber})`
+      );
+    } else {
+      // Only clear if not resuming
+      this.clearTempDirectory();
+    }
 
     // Start ffmpeg capture process
     const outputPattern = join(this.tempDir, "img_%05d.jpg");
     const interval = this.config.captureInterval;
 
-    // ffmpeg command: ffmpeg -rtsp_transport tcp -i {rtspUrl} -vf fps=1/{interval} -y {outputPattern}
+    // ffmpeg command: ffmpeg -rtsp_transport tcp -i {rtspUrl} -vf fps=1/{interval} -start_number {startNumber} -y {outputPattern}
     const ffmpegArgs = [
       "-rtsp_transport",
       "tcp",
@@ -50,6 +63,8 @@ export class TimelapseCapture {
       this.config.rtspUrl,
       "-vf",
       `fps=1/${interval}`,
+      "-start_number",
+      startNumber.toString(),
       "-y",
       outputPattern,
     ];
@@ -123,12 +138,25 @@ export class TimelapseCapture {
   }
 
   private clearTempDirectory(): void {
+    this.clearFrames();
+  }
+
+  /**
+   * Clears all captured frames from the temp directory.
+   * Call this after video assembly or when resuming state should be cleared.
+   */
+  clearFrames(): void {
     try {
       const files = readdirSync(this.tempDir);
+      let clearedCount = 0;
       for (const file of files) {
         if (file.startsWith("img_") && file.endsWith(".jpg")) {
           unlinkSync(join(this.tempDir, file));
+          clearedCount++;
         }
+      }
+      if (clearedCount > 0) {
+        console.log(`Cleared ${clearedCount} frames from temp directory`);
       }
     } catch (error) {
       // Directory might not exist or be empty, ignore
@@ -143,6 +171,55 @@ export class TimelapseCapture {
       ).length;
     } catch (error) {
       return 0;
+    }
+  }
+
+  canResume(): boolean {
+    return this.getCapturedFrameCount() > 0;
+  }
+
+  getHighestFrameNumber(): number {
+    try {
+      const files = readdirSync(this.tempDir);
+      const jpgFiles = files.filter(
+        (file) => file.startsWith("img_") && file.endsWith(".jpg")
+      );
+
+      if (jpgFiles.length === 0) {
+        return 0;
+      }
+
+      // Extract frame numbers and find the highest
+      const frameNumbers = jpgFiles.map((file) => {
+        const match = file.match(/img_(\d+)\.jpg/);
+        return match ? parseInt(match[1], 10) : 0;
+      });
+
+      return Math.max(...frameNumbers);
+    } catch (error) {
+      return 0;
+    }
+  }
+
+  getFrameInfo(): { count: number; lastFrame: string | null } {
+    try {
+      const files = readdirSync(this.tempDir);
+      const jpgFiles = files.filter(
+        (file) => file.startsWith("img_") && file.endsWith(".jpg")
+      );
+
+      if (jpgFiles.length === 0) {
+        return { count: 0, lastFrame: null };
+      }
+
+      // Sort files to find the last frame
+      jpgFiles.sort();
+      return {
+        count: jpgFiles.length,
+        lastFrame: jpgFiles[jpgFiles.length - 1],
+      };
+    } catch (error) {
+      return { count: 0, lastFrame: null };
     }
   }
 }
